@@ -1,17 +1,24 @@
-from aws_cdk import CfnOutput, Duration, RemovalPolicy, Size, Stack
-from aws_cdk import aws_batch as batch
+import cdk_eks_karpenter as eks_karpenter
+from aws_cdk import CfnOutput, RemovalPolicy, Stack
 from aws_cdk import aws_ec2 as ec2
-from aws_cdk import aws_ecs as ecs
+from aws_cdk import aws_eks as eks
+from aws_cdk import aws_iam as iam
 from aws_cdk import aws_s3 as s3
+from aws_cdk.lambda_layer_kubectl_v30 import KubectlV30Layer
 from constructs import Construct
 
 
 class AwsCheckStack(Stack):
-    def __init__(self, scope: Construct, construct_id: str, **kwargs) -> None:
+    def __init__(
+        self, scope: Construct, construct_id: str, user_name: str, **kwargs
+    ) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
-        # VPC
-        vpc = ec2.Vpc(self, "Vpc")
+        # # VPC
+        # vpc = ec2.Vpc(self, "Vpc")
+
+        # IAM
+        user = iam.User.from_user_name(self, "User", user_name)
 
         # S3
         bucket = s3.Bucket(
@@ -22,67 +29,98 @@ class AwsCheckStack(Stack):
         )
         CfnOutput(self, "BucketName", key="Bucket", value=bucket.bucket_name)
 
-        # Batch
-        compute_environment = batch.ManagedEc2EcsComputeEnvironment(
+        # EKS
+        cluster = eks.Cluster(
             self,
-            "ComputeEnvironment",
-            vpc=vpc,
-            spot=True,
-            spot_bid_percentage=100,
-            # instance_types=[],
-            use_optimal_instance_classes=True,  # TODO: 念の為これFalseにしてinstance_types指定したほうが良いかも
-            allocation_strategy=batch.AllocationStrategy.SPOT_PRICE_CAPACITY_OPTIMIZED,
-            minv_cpus=0,
-            maxv_cpus=256,
+            "Cluster",
+            version=eks.KubernetesVersion.V1_30,
+            kubectl_layer=KubectlV30Layer(self, "KubectlLayer"),
+            default_capacity=0,
+            core_dns_compute_type=eks.CoreDnsComputeType.FARGATE,
         )
-        bucket.grant_read_write(compute_environment.instance_role)
+        cluster.aws_auth.add_user_mapping(user, groups=["system:masters"])
+        CfnOutput(self, "ClusterName", key="Cluster", value=cluster.cluster_name)
 
-        job_queue = batch.JobQueue(
-            self,
-            "JobQueue",
-            job_queue_name="check-job-queue",
-            compute_environments=[
-                batch.OrderedComputeEnvironment(
-                    compute_environment=compute_environment, order=1
-                )
-            ],
-            job_state_time_limit_actions=[
-                batch.JobStateTimeLimitAction(
-                    max_time=Duration.minutes(10),
-                    reason=batch.JobStateTimeLimitActionsReason.COMPUTE_ENVIRONMENT_MAX_RESOURCE,
-                ),
-                batch.JobStateTimeLimitAction(
-                    max_time=Duration.minutes(10),
-                    reason=batch.JobStateTimeLimitActionsReason.INSUFFICIENT_INSTANCE_CAPACITY,
-                ),
-                batch.JobStateTimeLimitAction(
-                    max_time=Duration.minutes(10),
-                    reason=batch.JobStateTimeLimitActionsReason.JOB_RESOURCE_REQUIREMENT,
-                ),
+        # Karpenter
+        cluster.add_fargate_profile(
+            "karpenter",
+            selectors=[
+                {"namespace": "karpenter"},
+                {
+                    "namespace": "kube-system",
+                    "labels": {"k8s-app": "kube-dns"},
+                },
             ],
         )
 
-        container_definition = batch.EcsEc2ContainerDefinition(
+        karpenter = eks_karpenter.Karpenter(
             self,
-            "ContainerDefinition",
-            image=ecs.ContainerImage.from_registry(
-                "public.ecr.aws/amazonlinux/amazonlinux:latest"
-            ),
-            cpu=1,
-            memory=Size.mebibytes(1024),
-            command=["echo", "Hello, World!"],  # TODO: 置き換え
-            privileged=True,  # TODO: fuseを利用可能にするため。本当は避けた方が良い。
+            "Karpenter",
+            cluster=cluster,
+            version="0.37.0",
         )
 
-        job_definition = batch.EcsJobDefinition(
-            self,
-            "JobDefinition",
-            job_definition_name="check-job-definition",
-            container=container_definition,
-            retry_attempts=5,
-            retry_strategies=[
-                batch.RetryStrategy.of(
-                    batch.Action.RETRY, batch.Reason.SPOT_INSTANCE_RECLAIMED
-                )
-            ],
+        node_class = karpenter.add_ec2_node_class(
+            "node-class",
+            {
+                "amiFamily": "AL2",
+                "subnetSelectorTerms": [  # NOTE: よくわかってないけどとりあえずプライベートsubnetを指定
+                    {"id": subnet.subnet_id}
+                    for subnet in cluster.vpc.select_subnets(
+                        subnet_type=ec2.SubnetType.PRIVATE_WITH_NAT
+                    ).subnets
+                ],
+                "securityGroupSelectorTerms": [
+                    {"tags": {"aws:eks:cluster-name": cluster.cluster_name}}
+                ],
+                "role": karpenter.node_role.role_name,
+            },
+        )
+
+        karpenter.add_node_pool(
+            "node-pool",
+            {
+                "template": {
+                    "spec": {
+                        "nodeClassRef": {
+                            "apiVersion": "karpenter.k8s.aws/v1beta1",
+                            "kind": "EC2NodeClass",
+                            "name": node_class["name"],
+                        },
+                        "requirements": [
+                            {
+                                "key": "kubernetes.io/arch",
+                                "operator": "In",
+                                "values": ["amd64"],
+                            },
+                            {
+                                "key": "kubernetes.io/os",
+                                "operator": "In",
+                                "values": ["linux"],
+                            },
+                            {
+                                "key": "karpenter.sh/capacity-type",
+                                "operator": "In",
+                                "values": ["spot"],
+                            },
+                            {
+                                "key": "karpenter.k8s.aws/instance-category",
+                                "operator": "In",
+                                "values": ["c", "m", "r"],
+                            },
+                            {
+                                "key": "karpenter.k8s.aws/instance-generation",
+                                "operator": "Gt",
+                                "values": ["2"],
+                            },
+                        ],
+                    }
+                }
+            },
+        )
+
+        karpenter.add_managed_policy_to_karpenter_role(
+            iam.ManagedPolicy.from_aws_managed_policy_name(
+                "AmazonSSMManagedInstanceCore"
+            )
         )
