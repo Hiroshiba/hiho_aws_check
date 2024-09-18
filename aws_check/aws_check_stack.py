@@ -10,8 +10,48 @@ class AwsCheckStack(Stack):
     def __init__(self, scope: Construct, construct_id: str, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
+        # NAT インスタンス
+        # TODO: 自動アップデートを実装すべき
+        nat_instance = ec2.NatProvider.instance_v2(
+            instance_type=ec2.InstanceType.of(
+                ec2.InstanceClass.T4G, ec2.InstanceSize.NANO
+            ),
+            machine_image=ec2.MachineImage.latest_amazon_linux2023(
+                cpu_type=ec2.AmazonLinuxCpuType.ARM_64
+            ),
+            default_allowed_traffic=ec2.NatTrafficDirection.OUTBOUND_ONLY,
+        )
+
         # VPC
-        vpc = ec2.Vpc(self, "Vpc")
+        vpc = ec2.Vpc(
+            self,
+            "Vpc",
+            max_azs=1,
+            nat_gateways=1,
+            nat_gateway_provider=nat_instance,
+            ip_protocol=ec2.IpProtocol.DUAL_STACK,
+            subnet_configuration=[
+                ec2.SubnetConfiguration(
+                    cidr_mask=24,
+                    name="Public",
+                    subnet_type=ec2.SubnetType.PUBLIC,
+                    map_public_ip_on_launch=True,
+                ),
+                ec2.SubnetConfiguration(
+                    cidr_mask=24,
+                    name="Private",
+                    subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS,
+                ),
+            ],
+        )
+        nat_instance.security_group.add_ingress_rule(
+            peer=ec2.Peer.ipv4(vpc.vpc_cidr_block), connection=ec2.Port.all_traffic()
+        )
+
+        # Security Group
+        security_group = ec2.SecurityGroup(
+            self, "SecurityGroup", vpc=vpc, allow_all_ipv6_outbound=True
+        )
 
         # S3
         bucket = s3.Bucket(
@@ -27,6 +67,7 @@ class AwsCheckStack(Stack):
             self,
             "ComputeEnvironment",
             vpc=vpc,
+            security_groups=[security_group],
             spot=True,
             spot_bid_percentage=100,
             # instance_types=[],
@@ -79,7 +120,7 @@ class AwsCheckStack(Stack):
             "JobDefinition",
             job_definition_name="check-job-definition",
             container=container_definition,
-            retry_attempts=5,
+            retry_attempts=1,
             retry_strategies=[
                 batch.RetryStrategy.of(
                     batch.Action.RETRY, batch.Reason.SPOT_INSTANCE_RECLAIMED
